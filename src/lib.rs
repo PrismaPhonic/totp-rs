@@ -51,8 +51,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod custom_providers;
+mod encoding;
 mod rfc;
 mod secret;
+pub mod stack;
 mod url_error;
 
 #[cfg(feature = "qr")]
@@ -78,10 +80,6 @@ use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 type HmacSha1 = hmac::Hmac<sha1::Sha1>;
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 type HmacSha512 = hmac::Hmac<sha2::Sha512>;
-
-/// Alphabet for Steam tokens.
-#[cfg(feature = "steam")]
-const STEAM_CHARS: &str = "23456789BCDFGHJKMNPQRTVWXY";
 
 /// Algorithm enum holds the three standards algorithms for TOTP as per the [reference implementation](https://tools.ietf.org/html/rfc6238#appendix-A)
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -121,15 +119,16 @@ impl fmt::Display for Algorithm {
 }
 
 impl Algorithm {
-    fn hash<D>(mut digest: D, data: &[u8]) -> Vec<u8>
+    fn hash<D>(mut digest: D, data: &[u8]) -> encoding::HmacOutput
     where
         D: Mac,
     {
         digest.update(data);
-        digest.finalize().into_bytes().to_vec()
+        let result = digest.finalize().into_bytes();
+        encoding::HmacOutput::new(&result)
     }
 
-    fn sign(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+    pub(crate) fn sign(&self, key: &[u8], data: &[u8]) -> encoding::HmacOutput {
         match self {
             Algorithm::SHA1 => Algorithm::hash(HmacSha1::new_from_slice(key).unwrap(), data),
             Algorithm::SHA256 => Algorithm::hash(HmacSha256::new_from_slice(key).unwrap(), data),
@@ -140,7 +139,7 @@ impl Algorithm {
     }
 }
 
-fn system_time() -> Result<u64, SystemTimeError> {
+pub(crate) fn system_time() -> Result<u64, SystemTimeError> {
     let t = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     Ok(t)
 }
@@ -205,7 +204,7 @@ impl core::fmt::Display for TOTP {
             self.digits,
             self.step,
             self.algorithm,
-            self.issuer.clone().unwrap_or_else(|| "None".to_string()),
+            self.issuer.as_deref().unwrap_or("None"),
             self.account_name
         )
     }
@@ -409,38 +408,27 @@ impl TOTP {
 
     /// Will sign the given timestamp
     pub fn sign(&self, time: u64) -> Vec<u8> {
-        self.algorithm.sign(
-            self.secret.as_ref(),
-            (time / self.step).to_be_bytes().as_ref(),
-        )
+        self.algorithm
+            .sign(
+                self.secret.as_ref(),
+                (time / self.step).to_be_bytes().as_ref(),
+            )
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// Will generate a token given the provided timestamp in seconds, writing it
+    /// directly into the provided buffer. This method performs zero heap allocations.
+    pub fn generate_to(&self, time: u64, w: &mut impl fmt::Write) -> fmt::Result {
+        encoding::totp_generate_to(self.algorithm, self.digits, &self.secret, self.step, time, w)
     }
 
     /// Will generate a token given the provided timestamp in seconds
     pub fn generate(&self, time: u64) -> String {
-        let result: &[u8] = &self.sign(time);
-        let offset = (result.last().unwrap() & 15) as usize;
-        #[allow(unused_mut)]
-        let mut result =
-            u32::from_be_bytes(result[offset..offset + 4].try_into().unwrap()) & 0x7fff_ffff;
-
-        match self.algorithm {
-            Algorithm::SHA1 | Algorithm::SHA256 | Algorithm::SHA512 => format!(
-                "{1:00$}",
-                self.digits,
-                result % 10_u32.pow(self.digits as u32)
-            ),
-            #[cfg(feature = "steam")]
-            Algorithm::Steam => (0..self.digits)
-                .map(|_| {
-                    let c = STEAM_CHARS
-                        .chars()
-                        .nth(result as usize % STEAM_CHARS.len())
-                        .unwrap();
-                    result /= STEAM_CHARS.len() as u32;
-                    c
-                })
-                .collect(),
-        }
+        let mut buf = String::new();
+        self.generate_to(time, &mut buf)
+            .expect("fmt::Write on String never fails");
+        buf
     }
 
     /// Returns the timestamp of the first second for the next step
@@ -475,8 +463,10 @@ impl TOTP {
         let basestep = time / self.step - (self.skew as u64);
         for i in 0..(self.skew as u16) * 2 + 1 {
             let step_time = (basestep + (i as u64)) * self.step;
-
-            if constant_time_eq(self.generate(step_time).as_bytes(), token.as_bytes()) {
+            let mut buf = arrayvec::ArrayString::<16>::new();
+            self.generate_to(step_time, &mut buf)
+                .expect("token fits in ArrayString<16>");
+            if constant_time_eq(buf.as_bytes(), token.as_bytes()) {
                 return true;
             }
         }
@@ -489,12 +479,18 @@ impl TOTP {
         Ok(self.check(token, t))
     }
 
+    /// Write the base32 representation of the secret into the provided buffer.
+    /// This method performs zero heap allocations.
+    pub fn write_secret_base32(&self, w: &mut impl fmt::Write) -> fmt::Result {
+        encoding::write_base32(w, &self.secret)
+    }
+
     /// Will return the base32 representation of the secret, which might be useful when users want to manually add the secret to their authenticator
     pub fn get_secret_base32(&self) -> String {
-        base32::encode(
-            base32::Alphabet::Rfc4648 { padding: false },
-            self.secret.as_ref(),
-        )
+        let mut buf = String::new();
+        self.write_secret_base32(&mut buf)
+            .expect("fmt::Write on String never fails");
+        buf
     }
 
     /// Generate a TOTP from the standard otpauth URL
@@ -525,7 +521,7 @@ impl TOTP {
 
     /// Parse the TOTP parts from the standard otpauth URL
     #[cfg(feature = "otpauth")]
-    fn parts_from_url<S: AsRef<str>>(
+    pub(crate) fn parts_from_url<S: AsRef<str>>(
         url: S,
     ) -> Result<(Algorithm, usize, u8, u64, Vec<u8>, Option<String>, String), TotpUrlError> {
         let mut algorithm = Algorithm::SHA1;
@@ -635,6 +631,22 @@ impl TOTP {
         Ok((algorithm, digits, 1, step, secret, issuer, account_name))
     }
 
+    /// Write a standard otpauth:// URL into the provided buffer.
+    /// This method performs zero heap allocations.
+    #[cfg(feature = "otpauth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "otpauth")))]
+    pub fn write_url(&self, w: &mut impl fmt::Write) -> fmt::Result {
+        encoding::write_totp_url(
+            w,
+            self.algorithm,
+            self.digits,
+            self.step,
+            &self.secret,
+            self.issuer.as_deref(),
+            &self.account_name,
+        )
+    }
+
     /// Will generate a standard URL used to automatically add TOTP auths. Usually used with qr codes
     ///
     /// Label and issuer will be URL-encoded if needed be
@@ -642,32 +654,10 @@ impl TOTP {
     #[cfg(feature = "otpauth")]
     #[cfg_attr(docsrs, doc(cfg(feature = "otpauth")))]
     pub fn get_url(&self) -> String {
-        #[allow(unused_mut)]
-        let mut host = "totp";
-        #[cfg(feature = "steam")]
-        if self.algorithm == Algorithm::Steam {
-            host = "steam";
-        }
-        let account_name = urlencoding::encode(self.account_name.as_str()).to_string();
-        let mut params = vec![format!("secret={}", self.get_secret_base32())];
-        if self.digits != 6 {
-            params.push(format!("digits={}", self.digits));
-        }
-        if self.algorithm != Algorithm::SHA1 {
-            params.push(format!("algorithm={}", self.algorithm));
-        }
-        let label = if let Some(issuer) = &self.issuer {
-            let issuer = urlencoding::encode(issuer);
-            params.push(format!("issuer={}", issuer));
-            format!("{}:{}", issuer, account_name)
-        } else {
-            account_name
-        };
-        if self.step != 30 {
-            params.push(format!("period={}", self.step));
-        }
-
-        format!("otpauth://{}/{}?{}", host, label, params.join("&"))
+        let mut buf = String::new();
+        self.write_url(&mut buf)
+            .expect("fmt::Write on String never fails");
+        buf
     }
 }
 
