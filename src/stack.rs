@@ -30,14 +30,25 @@ pub const ISSUER_CAPACITY: usize = 64;
 /// Maximum byte length for an account name string.
 pub const ACCOUNT_NAME_CAPACITY: usize = 128;
 
+/// Stack-allocated raw secret bytes. Alias for the `ArrayVec` used in
+/// [`Secret::Raw`], [`Totp::secret`], and [`Rfc6238`] constructors.
+pub type SecretBytes = ArrayVec<u8, SECRET_CAPACITY>;
+/// Stack-allocated base32-encoded secret. Alias for the `ArrayString` used
+/// in [`Secret::Encoded`].
+pub type SecretEncoded = ArrayString<SECRET_ENCODED_CAPACITY>;
+/// Stack-allocated issuer string.
+pub type Issuer = ArrayString<ISSUER_CAPACITY>;
+/// Stack-allocated account name string.
+pub type AccountName = ArrayString<ACCOUNT_NAME_CAPACITY>;
+
 /// Stack-allocated shared secret. Equivalent to [`crate::Secret`] but backed
 /// by [`ArrayVec`] / [`ArrayString`] instead of [`Vec`] / [`String`].
 #[derive(Debug, Clone, Eq)]
 pub enum Secret {
     /// Non-encoded "raw" secret.
-    Raw(ArrayVec<u8, SECRET_CAPACITY>),
+    Raw(SecretBytes),
     /// Base32 encoded secret.
-    Encoded(ArrayString<SECRET_ENCODED_CAPACITY>),
+    Encoded(SecretEncoded),
 }
 
 impl PartialEq for Secret {
@@ -69,7 +80,7 @@ impl Secret {
     ///
     /// For `Encoded`, this decodes the base32 string (using a transient heap
     /// allocation from the `base32` crate) and copies into an [`ArrayVec`].
-    pub fn to_bytes(&self) -> Result<ArrayVec<u8, SECRET_CAPACITY>, SecretParseError> {
+    pub fn to_bytes(&self) -> Result<SecretBytes, SecretParseError> {
         match self {
             Secret::Raw(s) => Ok(s.clone()),
             Secret::Encoded(s) => {
@@ -147,13 +158,13 @@ pub struct Totp {
     pub digits: usize,
     pub skew: u8,
     pub step: u64,
-    pub secret: ArrayVec<u8, SECRET_CAPACITY>,
+    pub secret: SecretBytes,
     #[cfg(feature = "otpauth")]
     #[cfg_attr(docsrs, doc(cfg(feature = "otpauth")))]
-    pub issuer: Option<ArrayString<ISSUER_CAPACITY>>,
+    pub issuer: Option<Issuer>,
     #[cfg(feature = "otpauth")]
     #[cfg_attr(docsrs, doc(cfg(feature = "otpauth")))]
-    pub account_name: ArrayString<ACCOUNT_NAME_CAPACITY>,
+    pub account_name: AccountName,
 }
 
 impl PartialEq for Totp {
@@ -458,11 +469,11 @@ pub struct Rfc6238 {
     digits: usize,
     skew: u8,
     step: u64,
-    secret: ArrayVec<u8, SECRET_CAPACITY>,
+    secret: SecretBytes,
     #[cfg(feature = "otpauth")]
-    issuer: Option<ArrayString<ISSUER_CAPACITY>>,
+    issuer: Option<Issuer>,
     #[cfg(feature = "otpauth")]
-    account_name: ArrayString<ACCOUNT_NAME_CAPACITY>,
+    account_name: AccountName,
 }
 
 impl Rfc6238 {
@@ -470,7 +481,7 @@ impl Rfc6238 {
     /// Create a validated RFC 6238 configuration, taking ownership of the secret.
     pub fn new(
         digits: usize,
-        secret: ArrayVec<u8, SECRET_CAPACITY>,
+        secret: SecretBytes,
         issuer: Option<&str>,
         account_name: &str,
     ) -> Result<Self, Rfc6238Error> {
@@ -482,15 +493,15 @@ impl Rfc6238 {
             skew: 1,
             step: 30,
             secret,
-            issuer: issuer.map(|s| ArrayString::from(s).expect("issuer fits in ArrayString")),
-            account_name: ArrayString::from(account_name)
+            issuer: issuer.map(|s| Issuer::from(s).expect("issuer fits in ArrayString")),
+            account_name: AccountName::from(account_name)
                 .expect("account_name fits in ArrayString"),
         })
     }
 
     #[cfg(not(feature = "otpauth"))]
     /// Create a validated RFC 6238 configuration, taking ownership of the secret.
-    pub fn new(digits: usize, secret: ArrayVec<u8, SECRET_CAPACITY>) -> Result<Self, Rfc6238Error> {
+    pub fn new(digits: usize, secret: SecretBytes) -> Result<Self, Rfc6238Error> {
         crate::rfc::assert_digits(&digits)?;
         crate::rfc::assert_secret_length(&secret)?;
         Ok(Rfc6238 {
@@ -504,13 +515,13 @@ impl Rfc6238 {
 
     #[cfg(feature = "otpauth")]
     /// Create with default values: 6 digits, no issuer, empty account name.
-    pub fn with_defaults(secret: ArrayVec<u8, SECRET_CAPACITY>) -> Result<Self, Rfc6238Error> {
+    pub fn with_defaults(secret: SecretBytes) -> Result<Self, Rfc6238Error> {
         Rfc6238::new(6, secret, Some(""), "")
     }
 
     #[cfg(not(feature = "otpauth"))]
     /// Create with default values: 6 digits.
-    pub fn with_defaults(secret: ArrayVec<u8, SECRET_CAPACITY>) -> Result<Self, Rfc6238Error> {
+    pub fn with_defaults(secret: SecretBytes) -> Result<Self, Rfc6238Error> {
         Rfc6238::new(6, secret)
     }
 
@@ -818,7 +829,7 @@ mod tests {
         assert!(matches!(result.unwrap_err(), TotpUrlError::AccountName(_)));
     }
 
-    fn secret_arrayvec() -> ArrayVec<u8, SECRET_CAPACITY> {
+    fn secret_arrayvec() -> SecretBytes {
         let mut arr = ArrayVec::new();
         arr.try_extend_from_slice(SECRET_BYTES).unwrap();
         arr
