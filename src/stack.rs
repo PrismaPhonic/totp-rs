@@ -335,6 +335,15 @@ impl Totp {
         )
     }
 
+    /// Generate a token for the current system time, writing it directly into `w`.
+    /// This method is allocation free.
+    pub fn generate_current_to(&self, w: &mut impl fmt::Write) -> Result<(), SystemTimeError> {
+        let t = crate::system_time()?;
+        self.generate_to(t, w)
+            .expect("fmt::Write should not fail for correctly sized buffer");
+        Ok(())
+    }
+
     /// Check if `token` is valid for the given timestamp, accounting for
     /// [`skew`](Totp::skew). Performs **zero** heap allocations.
     pub fn check(&self, token: &str, time: u64) -> bool {
