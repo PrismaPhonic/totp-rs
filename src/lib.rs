@@ -54,6 +54,7 @@ mod custom_providers;
 mod encoding;
 mod rfc;
 mod secret;
+pub mod stack;
 mod url_error;
 
 #[cfg(feature = "qr")]
@@ -138,7 +139,7 @@ impl Algorithm {
     }
 }
 
-fn system_time() -> Result<u64, SystemTimeError> {
+pub(crate) fn system_time() -> Result<u64, SystemTimeError> {
     let t = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     Ok(t)
 }
@@ -520,7 +521,7 @@ impl TOTP {
 
     /// Parse the TOTP parts from the standard otpauth URL
     #[cfg(feature = "otpauth")]
-    fn parts_from_url<S: AsRef<str>>(
+    pub(crate) fn parts_from_url<S: AsRef<str>>(
         url: S,
     ) -> Result<(Algorithm, usize, u8, u64, Vec<u8>, Option<String>, String), TotpUrlError> {
         let mut algorithm = Algorithm::SHA1;

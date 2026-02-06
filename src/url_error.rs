@@ -36,6 +36,12 @@ pub enum TotpUrlError {
     AccountName(String),
     /// Couldn't parse account name.
     AccountNameDecoding(String),
+    /// Secret byte length exceeds stack type capacity.
+    SecretTooLong(usize),
+    /// Issuer string length exceeds stack type capacity.
+    IssuerTooLong(usize),
+    /// Account name string length exceeds stack type capacity.
+    AccountNameTooLong(usize),
 }
 
 impl std::error::Error for TotpUrlError {}
@@ -114,7 +120,22 @@ impl std::fmt::Display for TotpUrlError {
                 f,
                 "Error parsing URL: {}",
                 e
-            )
+            ),
+            TotpUrlError::SecretTooLong(len) => write!(
+                f,
+                "Secret of {} bytes exceeds stack type capacity",
+                len,
+            ),
+            TotpUrlError::IssuerTooLong(len) => write!(
+                f,
+                "Issuer of {} bytes exceeds stack type capacity",
+                len,
+            ),
+            TotpUrlError::AccountNameTooLong(len) => write!(
+                f,
+                "Account name of {} bytes exceeds stack type capacity",
+                len,
+            ),
         }
     }
 }
@@ -124,6 +145,7 @@ impl From<Rfc6238Error> for TotpUrlError {
         match e {
             Rfc6238Error::InvalidDigits(digits) => TotpUrlError::DigitsNumber(digits),
             Rfc6238Error::SecretTooSmall(bits) => TotpUrlError::SecretSize(bits),
+            Rfc6238Error::SecretTooLong(len) => TotpUrlError::SecretTooLong(len),
         }
     }
 }

@@ -12,6 +12,8 @@ pub enum Rfc6238Error {
     InvalidDigits(usize),
     /// The length of the shared secret MUST be at least 128 bits.
     SecretTooSmall(usize),
+    /// Secret byte length exceeds stack type capacity.
+    SecretTooLong(usize),
 }
 
 impl std::error::Error for Rfc6238Error {}
@@ -28,6 +30,11 @@ impl std::fmt::Display for Rfc6238Error {
                 f,
                 "The length of the shared secret MUST be at least 128 bits. {} bits is not enough",
                 bits,
+            ),
+            Rfc6238Error::SecretTooLong(len) => write!(
+                f,
+                "Secret of {} bytes exceeds stack type capacity",
+                len,
             ),
         }
     }

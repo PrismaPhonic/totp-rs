@@ -86,6 +86,8 @@ use constant_time_eq::constant_time_eq;
 pub enum SecretParseError {
     /// Invalid base32 input.
     ParseBase32,
+    /// Decoded/raw bytes exceed stack type capacity.
+    Capacity(usize),
 }
 
 impl std::error::Error for SecretParseError {}
@@ -94,6 +96,11 @@ impl std::fmt::Display for SecretParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SecretParseError::ParseBase32 => write!(f, "Could not decode base32 secret."),
+            SecretParseError::Capacity(len) => write!(
+                f,
+                "Secret of {} bytes exceeds stack type capacity.",
+                len
+            ),
         }
     }
 }
