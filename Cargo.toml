@@ -37,3 +37,6 @@ constant_time_eq = "0.3"
 rand = { version = "0.9", features = ["thread_rng"], optional = true, default-features = false }
 zeroize = { version = "1.6", features = ["alloc", "derive"], optional = true }
 qrcodegen-image = { version = "1.4", features = ["base64"], optional = true }
+
+[dev-dependencies]
+proptest = "1.7.0"

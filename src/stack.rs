@@ -1132,4 +1132,86 @@ mod tests {
         );
         assert!(result.is_err());
     }
+
+    /// Prop-test: verify that the stack URL parser produces the same round-trip
+    /// URL as the heap URL parser for randomly generated TOTP configurations.
+    #[cfg(feature = "otpauth")]
+    mod prop {
+        use proptest::prelude::*;
+
+        use super::Totp;
+        use crate::{Algorithm, TOTP};
+
+        fn email_strategy() -> impl Strategy<Value = String> {
+            // Local part: 1-64 chars from the valid set.  Domain: simple
+            // ASCII label + TLD to keep things realistic.
+            (
+                "[A-Za-z0-9_+.-]{1,64}",
+                "[A-Za-z0-9]{1,30}",
+                "[A-Za-z]{2,6}",
+            )
+                .prop_map(|(local, domain, tld)| format!("{}@{}.{}", local, domain, tld))
+        }
+
+        /// Issuer: ASCII printable, no `:`, 1-60 chars (fits in ISSUER_CAPACITY).
+        fn issuer_strategy() -> impl Strategy<Value = String> {
+            "[A-Za-z0-9 _.!@#$%^&*()-]{1,60}"
+        }
+
+        /// Secret: 16-24 random bytes (valid range for both heap and stack types).
+        fn secret_strategy() -> impl Strategy<Value = Vec<u8>> {
+            proptest::collection::vec(any::<u8>(), 16..=24)
+        }
+
+        fn algorithm_strategy() -> impl Strategy<Value = Algorithm> {
+            prop_oneof![
+                Just(Algorithm::SHA1),
+                Just(Algorithm::SHA256),
+                Just(Algorithm::SHA512),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn stack_from_url_matches_heap(
+                account_name in email_strategy(),
+                issuer in issuer_strategy(),
+                secret in secret_strategy(),
+                algorithm in algorithm_strategy(),
+                digits in (6u8..=8u8),
+            ) {
+                // 1. Build a heap TOTP (the known-good reference).
+                let heap_totp = TOTP::new(
+                    algorithm,
+                    digits as usize,
+                    1,
+                    30,
+                    secret,
+                    Some(issuer),
+                    account_name,
+                ).unwrap();
+
+                // 2. Generate the canonical URL from the heap type.
+                let url = heap_totp.get_url();
+
+                // 3. Parse with both parsers.
+                let heap_parsed = TOTP::from_url(&url)
+                    .expect("heap from_url should succeed on its own output");
+                let stack_parsed = Totp::from_url(&url)
+                    .expect("stack from_url should succeed on heap-generated URL");
+
+                // 4. Re-generate URLs and compare.
+                let heap_url = heap_parsed.get_url();
+                let mut stack_url = arrayvec::ArrayString::<512>::new();
+                stack_parsed.write_url(&mut stack_url).unwrap();
+
+                prop_assert_eq!(
+                    heap_url.as_str(),
+                    stack_url.as_str(),
+                    "Round-tripped URLs must be identical.\n  Original: {}\n  Heap:     {}\n  Stack:    {}",
+                    url, heap_url, stack_url,
+                );
+            }
+        }
+    }
 }
