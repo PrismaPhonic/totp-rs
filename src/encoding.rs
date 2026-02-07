@@ -52,6 +52,7 @@ pub(crate) fn write_base32(w: &mut impl fmt::Write, bytes: &[u8]) -> fmt::Result
 }
 
 /// Percent-encode `s` directly into a [`fmt::Write`] (RFC 3986 unreserved characters pass through).
+#[cfg(feature = "otpauth")]
 pub(crate) fn write_url_encoded(w: &mut impl fmt::Write, s: &str) -> fmt::Result {
     for byte in s.bytes() {
         match byte {

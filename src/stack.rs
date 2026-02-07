@@ -419,20 +419,163 @@ impl Totp {
 
     /// Parse a standard `otpauth://` URL into a stack-allocated `Totp`.
     ///
-    /// Internally uses the existing URL parser (which performs transient heap
-    /// allocations) and copies the results into fixed-capacity storage.
+    /// This parser is fully self-contained and performs zero heap
+    /// allocations on the happy path. It manually parses the URL scheme,
+    /// host, path and query parameters, percent-decodes path components
+    /// into [`ArrayString`] buffers, and base32-decodes the secret directly
+    /// into a [`SecretBytes`].
+    ///
+    /// Error paths may allocate when constructing [`TotpUrlError`] variants
+    /// that carry a `String` payload (these are exceptional and non-critical).
     pub fn from_url(url: &str) -> Result<Self, TotpUrlError> {
-        let (algorithm, digits, skew, step, secret, issuer, account_name) =
-            crate::TOTP::parts_from_url(url)?;
-        Totp::new(
+        // 1. Scheme
+        let rest = url.strip_prefix("otpauth://").ok_or_else(|| {
+            let scheme = url.split_once("://").map_or(url, |p| p.0);
+            TotpUrlError::Scheme(scheme.to_string())
+        })?;
+
+        // 2. Host — determines default algorithm
+        let mut algorithm = Algorithm::SHA1;
+
+        #[cfg(feature = "steam")]
+        let rest = if let Some(r) = rest.strip_prefix("totp/") {
+            r
+        } else if let Some(r) = rest.strip_prefix("steam/") {
+            algorithm = Algorithm::Steam;
+            r
+        } else {
+            let host = rest.split('/').next().unwrap_or(rest);
+            return Err(TotpUrlError::Host(host.to_string()));
+        };
+
+        #[cfg(not(feature = "steam"))]
+        let rest = if let Some(r) = rest.strip_prefix("totp/") {
+            r
+        } else {
+            let host = rest.split('/').next().unwrap_or(rest);
+            return Err(TotpUrlError::Host(host.to_string()));
+        };
+
+        // 3. Separate path from query string
+        let (path, query) = match rest.find('?') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+
+        // 4. Percent-decode path, split optional issuer:account
+        const PATH_CAP: usize = ISSUER_CAPACITY + 1 + ACCOUNT_NAME_CAPACITY;
+        let mut path_buf = ArrayString::<PATH_CAP>::new();
+        percent_decode_to(path, &mut path_buf)
+            .map_err(|_| TotpUrlError::AccountNameDecoding(path.to_string()))?;
+
+        let mut issuer: Option<Issuer> = None;
+        let account_name: AccountName;
+
+        if let Some((iss_str, acct_str)) = path_buf.split_once(':') {
+            issuer = Some(
+                Issuer::try_from(iss_str)
+                    .map_err(|_| TotpUrlError::IssuerTooLong(iss_str.len()))?,
+            );
+            account_name = AccountName::try_from(acct_str)
+                .map_err(|_| TotpUrlError::AccountNameTooLong(acct_str.len()))?;
+        } else {
+            account_name = AccountName::try_from(path_buf.as_str())
+                .map_err(|_| TotpUrlError::AccountNameTooLong(path_buf.len()))?;
+        }
+
+        // 5. Parse query parameters
+        let mut digits = 6usize;
+        let mut step = 30u64;
+        let mut secret = SecretBytes::new();
+
+        for pair in query.split('&').filter(|s| !s.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            match key {
+                #[cfg(feature = "steam")]
+                "algorithm" if algorithm == Algorithm::Steam => {
+                    // Do not override algorithm for Steam URLs.
+                }
+                "algorithm" => {
+                    algorithm = match value {
+                        "SHA1" => Algorithm::SHA1,
+                        "SHA256" => Algorithm::SHA256,
+                        "SHA512" => Algorithm::SHA512,
+                        _ => return Err(TotpUrlError::Algorithm(value.to_string())),
+                    };
+                }
+                "digits" => {
+                    digits = value
+                        .parse()
+                        .map_err(|_| TotpUrlError::Digits(value.to_string()))?;
+                }
+                "period" => {
+                    step = value
+                        .parse()
+                        .map_err(|_| TotpUrlError::Step(value.to_string()))?;
+                }
+                "secret" => {
+                    if !base32_decode_to(value, &mut secret) {
+                        return Err(TotpUrlError::Secret(value.to_string()));
+                    }
+                }
+                #[cfg(feature = "steam")]
+                "issuer" if value.eq_ignore_ascii_case("steam") => {
+                    algorithm = Algorithm::Steam;
+                    digits = 5;
+                    issuer = Some(Issuer::try_from("Steam").unwrap());
+                }
+                "issuer" => {
+                    // Percent-decode the issuer query value.
+                    let mut param_issuer = Issuer::new();
+                    percent_decode_to(value, &mut param_issuer)
+                        .map_err(|_| TotpUrlError::IssuerDecoding(value.to_string()))?;
+
+                    if let Some(ref path_issuer) = issuer {
+                        if path_issuer.as_str() != param_issuer.as_str() {
+                            return Err(TotpUrlError::IssuerMistmatch(
+                                path_issuer.to_string(),
+                                param_issuer.to_string(),
+                            ));
+                        }
+                    }
+                    issuer = Some(param_issuer);
+
+                    #[cfg(feature = "steam")]
+                    if param_issuer.as_str() == "Steam" {
+                        algorithm = Algorithm::Steam;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        #[cfg(feature = "steam")]
+        if algorithm == Algorithm::Steam {
+            digits = 5;
+            step = 30;
+            issuer = Some(Issuer::try_from("Steam").unwrap());
+        }
+
+        if secret.is_empty() {
+            return Err(TotpUrlError::Secret(String::new()));
+        }
+
+        // 6. Construct — skipping redundant validation since we parsed directly
+        crate::rfc::assert_digits(&digits)?;
+        crate::rfc::assert_secret_length(&secret)?;
+        if secret.len() > SECRET_CAPACITY {
+            return Err(TotpUrlError::SecretTooLong(secret.len()));
+        }
+
+        Ok(Totp {
             algorithm,
             digits,
-            skew,
+            skew: 1,
             step,
-            &secret,
-            issuer.as_deref(),
-            &account_name,
-        )
+            secret,
+            issuer,
+            account_name,
+        })
     }
 }
 
@@ -460,6 +603,111 @@ impl Totp {
             .expect("writing to String cannot fail");
         qrcodegen_image::draw_png(&url)
     }
+}
+
+/// Convert a hex ASCII digit to its 4-bit numeric value.
+#[cfg(feature = "otpauth")]
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode `input` into a [`fmt::Write`] sink (e.g. `ArrayString`).
+///
+/// Handles multi-byte UTF-8 sequences that span multiple `%XX` triplets.
+/// Returns `Err(())` on malformed percent-encoding or invalid UTF-8.
+#[cfg(feature = "otpauth")]
+fn percent_decode_to(input: &str, w: &mut impl fmt::Write) -> Result<(), ()> {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut utf8_buf = [0u8; 4];
+    let mut utf8_len: usize = 0;
+    let mut utf8_expected: usize = 0;
+
+    while i < bytes.len() {
+        let byte = if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_val(bytes[i + 1]).ok_or(())?;
+            let lo = hex_val(bytes[i + 2]).ok_or(())?;
+            i += 3;
+            (hi << 4) | lo
+        } else {
+            let b = bytes[i];
+            i += 1;
+            b
+        };
+
+        if utf8_len > 0 {
+            // We are in a multi-byte UTF-8 sequence — expect continuation byte.
+            if byte & 0xC0 != 0x80 {
+                return Err(());
+            }
+            utf8_buf[utf8_len] = byte;
+            utf8_len += 1;
+            if utf8_len == utf8_expected {
+                let s = core::str::from_utf8(&utf8_buf[..utf8_len]).map_err(|_| ())?;
+                w.write_str(s).map_err(|_| ())?;
+                utf8_len = 0;
+            }
+        } else if byte < 0x80 {
+            // Plain ASCII byte.
+            w.write_char(byte as char).map_err(|_| ())?;
+        } else if byte & 0xE0 == 0xC0 {
+            utf8_buf[0] = byte;
+            utf8_len = 1;
+            utf8_expected = 2;
+        } else if byte & 0xF0 == 0xE0 {
+            utf8_buf[0] = byte;
+            utf8_len = 1;
+            utf8_expected = 3;
+        } else if byte & 0xF8 == 0xF0 {
+            utf8_buf[0] = byte;
+            utf8_len = 1;
+            utf8_expected = 4;
+        } else {
+            return Err(());
+        }
+    }
+
+    if utf8_len > 0 {
+        // Truncated multi-byte sequence at end of input.
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Decode RFC 4648 base32 (no padding, case-insensitive) directly into a
+/// [`SecretBytes`] buffer. Returns `false` on invalid characters or overflow.
+#[cfg(feature = "otpauth")]
+fn base32_decode_to(input: &str, out: &mut SecretBytes) -> bool {
+    let input = input.trim_end_matches('=');
+    let bytes = input.as_bytes();
+    let mut buf: u64 = 0;
+    let mut bits: u32 = 0;
+
+    for &b in bytes {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a',
+            b'2'..=b'7' => b - b'2' + 26,
+            _ => return false,
+        };
+
+        buf = (buf << 5) | val as u64;
+        bits += 5;
+
+        if bits >= 8 {
+            bits -= 8;
+            if out.try_push((buf >> bits) as u8).is_err() {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 /// Stack-allocated [RFC 6238](https://tools.ietf.org/html/rfc6238) configuration.
