@@ -21,6 +21,49 @@ use std::time::SystemTimeError;
 use crate::encoding;
 use crate::{Algorithm, Rfc6238Error, SecretParseError, TotpUrlError};
 
+#[inline(always)]
+#[cfg(feature = "qr")]
+fn estimated_png_capacity(raw_len: usize) -> usize {
+    // Conservative estimate tuned from bounded ASCII otpauth payloads.
+    // Keeps capacity slack controlled while avoiding reallocs for common cases.
+    raw_len / 48 + 512
+}
+
+#[cfg(feature = "qr")]
+fn draw_png_with_capacity(text: &str) -> Result<Vec<u8>, String> {
+    use qrcodegen_image::image::ImageEncoder as _;
+
+    let qr = qrcodegen_image::qrcodegen::QrCode::encode_text(
+        text,
+        qrcodegen_image::qrcodegen::QrCodeEcc::Medium,
+    )
+    .map_err(|err| err.to_string())?;
+
+    // Keep the same scaling/quiet-zone behavior as qrcodegen-image::draw_png.
+    let image_size = (qr.size() as u32) * 8 + 8 * 8;
+    let canvas = qrcodegen_image::draw_canvas(qr);
+    let raw = canvas.into_raw();
+
+    let mut png = Vec::with_capacity(estimated_png_capacity(raw.len()));
+    let encoder = qrcodegen_image::image::codecs::png::PngEncoder::new(&mut png);
+    encoder
+        .write_image(
+            &raw,
+            image_size,
+            image_size,
+            qrcodegen_image::image::ExtendedColorType::L8,
+        )
+        .map_err(|err| err.to_string())?;
+
+    Ok(png)
+}
+
+#[cfg(feature = "qr")]
+fn draw_base64_with_capacity(text: &str) -> Result<String, String> {
+    use base64::{engine::general_purpose, Engine as _};
+    draw_png_with_capacity(text).map(|png| general_purpose::STANDARD.encode(png))
+}
+
 /// Maximum byte length for a raw secret.
 pub const SECRET_CAPACITY: usize = 24;
 /// Maximum character length for a base32-encoded secret.
@@ -585,13 +628,13 @@ impl Totp {
     /// Return a QR code as a base64-encoded PNG string.
     ///
     /// Generates the `otpauth://` URL into a heap-allocated `String`
-    /// (unavoidable for the QR encoder), then delegates to
-    /// [`qrcodegen_image::draw_base64`].
+    /// (unavoidable for the QR encoder), then encodes through a pre-sized
+    /// PNG buffer to reduce realloc churn in allocation-sensitive paths.
     pub fn get_qr_base64(&self) -> Result<String, String> {
         let mut url = String::new();
         self.write_url(&mut url)
             .expect("writing to String cannot fail");
-        qrcodegen_image::draw_base64(&url)
+        draw_base64_with_capacity(&url)
     }
 
     /// Return a QR code as PNG bytes.
@@ -601,7 +644,7 @@ impl Totp {
         let mut url = String::new();
         self.write_url(&mut url)
             .expect("writing to String cannot fail");
-        qrcodegen_image::draw_png(&url)
+        draw_png_with_capacity(&url)
     }
 }
 
@@ -1043,6 +1086,172 @@ mod tests {
         assert_eq!(totp.secret.as_slice(), SECRET_BYTES);
         assert_eq!(totp.issuer.as_deref(), Some("Github"));
         assert_eq!(totp.account_name.as_str(), "constantoine@github.com");
+    }
+
+    #[test]
+    #[cfg(feature = "qr")]
+    fn generates_qr() {
+        use qrcodegen_image::qrcodegen;
+        use sha2::{Digest, Sha512};
+
+        let totp = Totp::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            30,
+            SECRET_BYTES,
+            Some("Github"),
+            "constantoine@github.com",
+        )
+        .unwrap();
+        let mut url = ArrayString::<512>::new();
+        totp.write_url(&mut url).unwrap();
+        let qr = qrcodegen::QrCode::encode_text(url.as_str(), qrcodegen::QrCodeEcc::Medium)
+            .expect("could not generate qr");
+        let data = qrcodegen_image::draw_canvas(qr).into_raw();
+
+        // Create hash from image
+        let hash_digest = Sha512::digest(data);
+        assert_eq!(
+            format!("{:x}", hash_digest).as_str(),
+            "fbb0804f1e4f4c689d22292c52b95f0783b01b4319973c0c50dd28af23dbbbe663dce4eb05a7959086d9092341cb9f103ec5a9af4a973867944e34c063145328"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "qr")]
+    fn generates_qr_base64_ok() {
+        let totp = Totp::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            1,
+            SECRET_BYTES,
+            Some("Github"),
+            "constantoine@github.com",
+        )
+        .unwrap();
+        let qr = totp.get_qr_base64();
+        assert!(qr.is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "qr")]
+    fn generates_qr_png_ok() {
+        let totp = Totp::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            1,
+            SECRET_BYTES,
+            Some("Github"),
+            "constantoine@github.com",
+        )
+        .unwrap();
+        let qr = totp.get_qr_png();
+        assert!(qr.is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "qr")]
+    fn draw_png_with_capacity_gap_reasonable_for_ascii_cases() {
+        let cases = [
+            ("short", "Auth", "a@b.co"),
+            ("typical", "Github", "constantoine@github.com"),
+            (
+                "long_ascii",
+                "ExampleCorpAPAC",
+                "averylongbutrealisticaddressstyleidentifier@example.com",
+            ),
+            (
+                "near_max_ascii",
+                "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com",
+            ),
+        ];
+
+        for (label, issuer, account_name) in cases {
+            let totp = Totp::new(
+                Algorithm::SHA1,
+                6,
+                1,
+                1,
+                SECRET_BYTES,
+                Some(issuer),
+                account_name,
+            )
+            .unwrap();
+
+            let mut url = ArrayString::<512>::new();
+            totp.write_url(&mut url).unwrap();
+
+            let qr = qrcodegen_image::qrcodegen::QrCode::encode_text(
+                url.as_str(),
+                qrcodegen_image::qrcodegen::QrCodeEcc::Medium,
+            )
+            .expect("could not generate qr");
+            let raw_len = qrcodegen_image::draw_canvas(qr).into_raw().len();
+            let expected_initial_capacity = estimated_png_capacity(raw_len);
+
+            let png = draw_png_with_capacity(url.as_str()).expect("could not draw png");
+            let len = png.len();
+            let cap = png.capacity();
+            let gap = cap - len;
+            let grew = cap > expected_initial_capacity;
+
+            assert!(
+                !grew,
+                "draw_png_with_capacity reallocated for {label}: url_len={}, len={}, cap={}, initial={}",
+                url.len(),
+                len,
+                cap,
+                expected_initial_capacity
+            );
+
+            assert!(
+                gap <= 1024,
+                "draw_png_with_capacity oversized for {label}: url_len={}, len={}, cap={}, gap={}",
+                url.len(),
+                len,
+                cap,
+                gap
+            );
+        }
+    }
+    #[test]
+    #[cfg(feature = "qr")]
+    fn stack_and_heap_qr_outputs_match() {
+        use crate::TOTP;
+
+        let heap_totp = TOTP::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            1,
+            SECRET_BYTES.to_vec(),
+            Some("Github".to_string()),
+            "constantoine@github.com".to_string(),
+        )
+        .unwrap();
+
+        let stack_totp = Totp::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            1,
+            SECRET_BYTES,
+            Some("Github"),
+            "constantoine@github.com",
+        )
+        .unwrap();
+
+        let heap_png = heap_totp.get_qr_png().unwrap();
+        let stack_png = stack_totp.get_qr_png().unwrap();
+        assert_eq!(stack_png, heap_png);
+
+        let heap_base64 = heap_totp.get_qr_base64().unwrap();
+        let stack_base64 = stack_totp.get_qr_base64().unwrap();
+        assert_eq!(stack_base64, heap_base64);
     }
 
     #[test]
